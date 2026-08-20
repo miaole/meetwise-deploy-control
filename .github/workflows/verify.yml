@@ -23,10 +23,32 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     environment: preview-verifier
     steps:
-      - name: Independent HTTPS probe and receipt signing
+      - name: Checkout the fixed verifier source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the pinned verifier runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.22.3'
+          cache: npm
+
+      - name: Install the locked browser verifier
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run verifier behavior proof before browser E2E
+        run: node scripts/verify-preview-e2e.proof.mjs
+
+      - name: Install the pinned Chromium runtime
+        run: ./node_modules/.bin/playwright install --with-deps chromium
+
+      - name: Independent HTTPS probe
         id: probe
         shell: bash
         env:
@@ -35,10 +57,9 @@ jobs:
           EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_manifest_sha256 }}
           ALLOWED_ORIGIN: ${{ secrets.ALLOWED_ORIGIN }}
           MANIFEST_PUBLIC_KEY: ${{ secrets.MANIFEST_PUBLIC_KEY }}
-          PROBE_SIGNING_KEY: ${{ secrets.PROBE_SIGNING_KEY }}
         run: |
           node <<'NODE'
-          const { createHash, createPrivateKey, createPublicKey, sign, verify } = require('node:crypto');
+          const { createHash, createPublicKey, verify } = require('node:crypto');
           const canonical = v => Array.isArray(v) ? `[${v.map(canonical).join(',')}]` : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k=>`${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}` : JSON.stringify(v);
           const sha = v => createHash('sha256').update(v).digest('hex');
           const origin = process.env.REQUESTED_ORIGIN;
@@ -69,21 +90,34 @@ jobs:
             const loginReceipt={status:200,bytes:Buffer.byteLength(login),sha256:sha(login)};
             const blackbox=sha(canonical({root:rootReceipt,login:loginReceipt}));
             if(manifest.receipts?.edge!==rootReceipt.sha256||manifest.receipts?.blackbox!==blackbox) throw new Error('surface_receipt_mismatch');
-            const receipt={schemaVersion:1,origin,probeNonce:nonce,checkedAt:new Date(now).toISOString(),manifestSha256,rootStatus:200,loginStatus:200,manifestStatus:200,rootUrl:`${origin}/`,loginUrl:`${origin}/login`,manifestUrl:`${origin}/preview-release-manifest.json`,rootSha256:rootReceipt.sha256,blackboxSha256:blackbox,signingKeyId:'probe-receipt-ed25519-v1'};
-            receipt.signature=sign(null,Buffer.from(canonical(receipt)),createPrivateKey(process.env.PROBE_SIGNING_KEY)).toString('base64');
             const fs = require('node:fs');
-            const artifactName = `meetwise-public-origin-receipt-${nonce}`;
-            const artifactPath = `${process.env.RUNNER_TEMP}/receipt.json`;
+            const context={schemaVersion:1,origin,probeNonce:nonce,checkedAt:new Date(now).toISOString(),manifestSha256,rootStatus:200,loginStatus:200,manifestStatus:200,rootUrl:`${origin}/`,loginUrl:`${origin}/login`,manifestUrl:`${origin}/preview-release-manifest.json`,rootSha256:rootReceipt.sha256,blackboxSha256:blackbox};
+            const artifactPath = `${process.env.RUNNER_TEMP}/probe-context.json`;
             const fd = fs.openSync(artifactPath, 'wx', 0o600);
-            try { fs.writeFileSync(fd, `${JSON.stringify(receipt)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-            fs.appendFileSync(process.env.GITHUB_OUTPUT,`receipt_path=${artifactPath}\n`);
+            try { fs.writeFileSync(fd, `${JSON.stringify(context)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,`context_path=${artifactPath}\n`);
           })().catch(e=>{console.error(e.message);process.exit(1)});
           NODE
+
+      - name: Real browser B/C login and read-only E2E
+        id: e2e
+        shell: bash
+        env:
+          REQUESTED_ORIGIN: ${{ inputs.origin }}
+          PROBE_NONCE: ${{ inputs.probe_nonce }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_manifest_sha256 }}
+          PROBE_CONTEXT_PATH: ${{ steps.probe.outputs.context_path }}
+          PROBE_SIGNING_KEY: ${{ secrets.PROBE_SIGNING_KEY }}
+          PREVIEW_C_EMAIL: ${{ secrets.PREVIEW_C_EMAIL }}
+          PREVIEW_C_PASSWORD: ${{ secrets.PREVIEW_C_PASSWORD }}
+          PREVIEW_B_EMAIL: ${{ secrets.PREVIEW_B_EMAIL }}
+          PREVIEW_B_PASSWORD: ${{ secrets.PREVIEW_B_PASSWORD }}
+        run: node scripts/verify-preview-e2e.mjs
 
       - name: Upload the exact signed receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: meetwise-public-origin-receipt-${{ inputs.probe_nonce }}
-          path: ${{ steps.probe.outputs.receipt_path }}
+          path: ${{ steps.e2e.outputs.receipt_path }}
           if-no-files-found: error
           retention-days: 1
