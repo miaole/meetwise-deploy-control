@@ -1,0 +1,64 @@
+name: verify-meetwise-public-origin
+
+on:
+  workflow_call:
+    inputs:
+      origin: { required: true, type: string }
+      probe_nonce: { required: true, type: string }
+    outputs:
+      receipt_b64:
+        value: ${{ jobs.verify.outputs.receipt_b64 }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: preview-verifier
+    outputs:
+      receipt_b64: ${{ steps.probe.outputs.receipt_b64 }}
+    steps:
+      - name: Independent HTTPS probe and receipt signing
+        id: probe
+        shell: bash
+        env:
+          REQUESTED_ORIGIN: ${{ inputs.origin }}
+          PROBE_NONCE: ${{ inputs.probe_nonce }}
+          ALLOWED_ORIGIN: ${{ secrets.ALLOWED_ORIGIN }}
+          MANIFEST_PUBLIC_KEY: ${{ secrets.MANIFEST_PUBLIC_KEY }}
+          PROBE_SIGNING_KEY: ${{ secrets.PROBE_SIGNING_KEY }}
+        run: |
+          node <<'NODE'
+          const { createHash, createPrivateKey, createPublicKey, sign, verify } = require('node:crypto');
+          const canonical = v => Array.isArray(v) ? `[${v.map(canonical).join(',')}]` : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k=>`${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}` : JSON.stringify(v);
+          const sha = v => createHash('sha256').update(v).digest('hex');
+          const origin = process.env.REQUESTED_ORIGIN;
+          const nonce = process.env.PROBE_NONCE;
+          if (origin !== process.env.ALLOWED_ORIGIN || !/^https:\/\/[a-z0-9-]+\.tail[a-z0-9]+\.ts\.net$/.test(origin) || !/^[a-f0-9]{64}$/.test(nonce)) throw new Error('probe_input_rejected');
+          const bounded = async path => {
+            const url = `${origin}${path}`;
+            const r = await fetch(url, { redirect:'error', cache:'no-store', signal:AbortSignal.timeout(20000) });
+            if (r.status !== 200 || r.url !== url || !r.body) throw new Error('probe_surface_invalid');
+            const reader = r.body.getReader(); const chunks=[]; let bytes=0;
+            for (;;) { const {done,value}=await reader.read(); if(done) break; bytes+=value.byteLength; if(bytes>2000000){await reader.cancel();throw new Error('probe_surface_too_large')} chunks.push(value); }
+            return Buffer.concat(chunks).toString('utf8');
+          };
+          (async()=>{
+            const [root,login,manifestText] = await Promise.all([bounded('/'),bounded('/login'),bounded('/preview-release-manifest.json')]);
+            const manifest=JSON.parse(manifestText); const {signature,...unsigned}=manifest;
+            if (!verify(null,Buffer.from(canonical(unsigned)),createPublicKey(process.env.MANIFEST_PUBLIC_KEY),Buffer.from(signature,'base64'))) throw new Error('manifest_signature_invalid');
+            if (manifest.status!=='verified'||manifest.revoked!==false||manifest.mode!=='public-full-stack-probe'||manifest.origin!==origin) throw new Error('manifest_state_invalid');
+            const issued=Date.parse(manifest.issuedAt), expires=Date.parse(manifest.expiresAt), now=Date.now();
+            if(!Number.isFinite(issued)||!Number.isFinite(expires)||issued>now+30000||expires<=now||expires-issued>14*86400000) throw new Error('manifest_time_invalid');
+            if(!root.includes('Meetwise 知面')||!root.includes('href="/login"')||!login.includes('name="email"')||!login.includes('name="password"')) throw new Error('surface_content_invalid');
+            const rootReceipt={status:200,bytes:Buffer.byteLength(root),sha256:sha(root)};
+            const loginReceipt={status:200,bytes:Buffer.byteLength(login),sha256:sha(login)};
+            const blackbox=sha(canonical({root:rootReceipt,login:loginReceipt}));
+            if(manifest.receipts?.edge!==rootReceipt.sha256||manifest.receipts?.blackbox!==blackbox) throw new Error('surface_receipt_mismatch');
+            const receipt={schemaVersion:1,origin,probeNonce:nonce,checkedAt:new Date(now).toISOString(),manifestSha256:sha(canonical(manifest)),rootStatus:200,loginStatus:200,manifestStatus:200,rootUrl:`${origin}/`,loginUrl:`${origin}/login`,manifestUrl:`${origin}/preview-release-manifest.json`,rootSha256:rootReceipt.sha256,blackboxSha256:blackbox,signingKeyId:'probe-receipt-ed25519-v1'};
+            receipt.signature=sign(null,Buffer.from(canonical(receipt)),createPrivateKey(process.env.PROBE_SIGNING_KEY)).toString('base64');
+            require('node:fs').appendFileSync(process.env.GITHUB_OUTPUT,`receipt_b64=${Buffer.from(JSON.stringify(receipt)).toString('base64')}\n`);
+          })().catch(e=>{console.error(e.message);process.exit(1)});
+          NODE
