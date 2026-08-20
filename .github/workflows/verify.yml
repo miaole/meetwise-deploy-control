@@ -1,13 +1,21 @@
 name: verify-meetwise-public-origin
+run-name: meetwise-public-origin-${{ inputs.probe_nonce }}
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
-      origin: { required: true, type: string }
-      probe_nonce: { required: true, type: string }
-    outputs:
-      receipt_b64:
-        value: ${{ jobs.verify.outputs.receipt_b64 }}
+      origin:
+        description: Exact public Tailscale origin to probe
+        required: true
+        type: string
+      probe_nonce:
+        description: One-time 64-hex nonce issued by the ECS controller
+        required: true
+        type: string
+      expected_manifest_sha256:
+        description: Expected canonical SHA-256 identity of the public manifest
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,8 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: preview-verifier
-    outputs:
-      receipt_b64: ${{ steps.probe.outputs.receipt_b64 }}
     steps:
       - name: Independent HTTPS probe and receipt signing
         id: probe
@@ -26,6 +32,7 @@ jobs:
         env:
           REQUESTED_ORIGIN: ${{ inputs.origin }}
           PROBE_NONCE: ${{ inputs.probe_nonce }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_manifest_sha256 }}
           ALLOWED_ORIGIN: ${{ secrets.ALLOWED_ORIGIN }}
           MANIFEST_PUBLIC_KEY: ${{ secrets.MANIFEST_PUBLIC_KEY }}
           PROBE_SIGNING_KEY: ${{ secrets.PROBE_SIGNING_KEY }}
@@ -36,10 +43,11 @@ jobs:
           const sha = v => createHash('sha256').update(v).digest('hex');
           const origin = process.env.REQUESTED_ORIGIN;
           const nonce = process.env.PROBE_NONCE;
-          if (origin !== process.env.ALLOWED_ORIGIN || !/^https:\/\/[a-z0-9-]+\.tail[a-z0-9]+\.ts\.net$/.test(origin) || !/^[a-f0-9]{64}$/.test(nonce)) throw new Error('probe_input_rejected');
+          const expectedManifestSha256 = process.env.EXPECTED_MANIFEST_SHA256;
+          if (origin !== process.env.ALLOWED_ORIGIN || !/^https:\/\/[a-z0-9-]+\.tail[a-z0-9]+\.ts\.net$/.test(origin) || !/^[a-f0-9]{64}$/.test(nonce) || !/^[a-f0-9]{64}$/.test(expectedManifestSha256)) throw new Error('probe_input_rejected');
           const bounded = async path => {
             const url = `${origin}${path}`;
-            const r = await fetch(url, { redirect:'error', cache:'no-store', signal:AbortSignal.timeout(20000) });
+            const r = await fetch(url, { method:'GET', redirect:'error', cache:'no-store', headers:{accept:'text/html,application/json'}, signal:AbortSignal.timeout(20000) });
             if (r.status !== 200 || r.url !== url || !r.body) throw new Error('probe_surface_invalid');
             const reader = r.body.getReader(); const chunks=[]; let bytes=0;
             for (;;) { const {done,value}=await reader.read(); if(done) break; bytes+=value.byteLength; if(bytes>2000000){await reader.cancel();throw new Error('probe_surface_too_large')} chunks.push(value); }
@@ -48,17 +56,34 @@ jobs:
           (async()=>{
             const [root,login,manifestText] = await Promise.all([bounded('/'),bounded('/login'),bounded('/preview-release-manifest.json')]);
             const manifest=JSON.parse(manifestText); const {signature,...unsigned}=manifest;
+            if (!/^[A-Za-z0-9+/]+={0,2}$/.test(signature ?? '') || manifest.schemaVersion !== 1 || manifest.signingKeyId !== 'ecs-preview-ed25519-v1') throw new Error('manifest_shape_invalid');
             if (!verify(null,Buffer.from(canonical(unsigned)),createPublicKey(process.env.MANIFEST_PUBLIC_KEY),Buffer.from(signature,'base64'))) throw new Error('manifest_signature_invalid');
-            if (manifest.status!=='verified'||manifest.revoked!==false||manifest.mode!=='public-full-stack-probe'||manifest.origin!==origin) throw new Error('manifest_state_invalid');
+            const requiredReceipts = ['runtime','synthetic','database','edge','blackbox'];
+            if (manifest.status!=='verified'||manifest.revoked!==false||manifest.mode!=='public-full-stack-probe'||manifest.origin!==origin || !/^[a-f0-9]{7,64}$/.test(manifest.releaseDigest ?? '') || !/^[a-f0-9]{40}$/.test(manifest.commit ?? '') || !/^[a-f0-9]{40}$/.test(manifest.tree ?? '') || !/^[a-f0-9]{64}$/.test(manifest.webBuildSha256 ?? '') || !/^[a-f0-9]{64}$/.test(manifest.staticAssetsSha256 ?? '') || !manifest.receipts || JSON.stringify(Object.keys(manifest.receipts).sort()) !== JSON.stringify(requiredReceipts.sort()) || requiredReceipts.some(key => !/^[a-f0-9]{64}$/.test(manifest.receipts[key] ?? ''))) throw new Error('manifest_state_invalid');
             const issued=Date.parse(manifest.issuedAt), expires=Date.parse(manifest.expiresAt), now=Date.now();
             if(!Number.isFinite(issued)||!Number.isFinite(expires)||issued>now+30000||expires<=now||expires-issued>14*86400000) throw new Error('manifest_time_invalid');
-            if(!root.includes('Meetwise 知面')||!root.includes('href="/login"')||!login.includes('name="email"')||!login.includes('name="password"')) throw new Error('surface_content_invalid');
+            const manifestSha256 = sha(canonical(manifest));
+            if (manifestSha256 !== expectedManifestSha256) throw new Error('manifest_identity_mismatch');
+            if(!root.includes('Meetwise 知面')||!root.includes('href="/login"')||!login.includes('name="email"')||!login.includes('name="password"')||!login.includes('登录 / 注册')) throw new Error('surface_content_invalid');
             const rootReceipt={status:200,bytes:Buffer.byteLength(root),sha256:sha(root)};
             const loginReceipt={status:200,bytes:Buffer.byteLength(login),sha256:sha(login)};
             const blackbox=sha(canonical({root:rootReceipt,login:loginReceipt}));
             if(manifest.receipts?.edge!==rootReceipt.sha256||manifest.receipts?.blackbox!==blackbox) throw new Error('surface_receipt_mismatch');
-            const receipt={schemaVersion:1,origin,probeNonce:nonce,checkedAt:new Date(now).toISOString(),manifestSha256:sha(canonical(manifest)),rootStatus:200,loginStatus:200,manifestStatus:200,rootUrl:`${origin}/`,loginUrl:`${origin}/login`,manifestUrl:`${origin}/preview-release-manifest.json`,rootSha256:rootReceipt.sha256,blackboxSha256:blackbox,signingKeyId:'probe-receipt-ed25519-v1'};
+            const receipt={schemaVersion:1,origin,probeNonce:nonce,checkedAt:new Date(now).toISOString(),manifestSha256,rootStatus:200,loginStatus:200,manifestStatus:200,rootUrl:`${origin}/`,loginUrl:`${origin}/login`,manifestUrl:`${origin}/preview-release-manifest.json`,rootSha256:rootReceipt.sha256,blackboxSha256:blackbox,signingKeyId:'probe-receipt-ed25519-v1'};
             receipt.signature=sign(null,Buffer.from(canonical(receipt)),createPrivateKey(process.env.PROBE_SIGNING_KEY)).toString('base64');
-            require('node:fs').appendFileSync(process.env.GITHUB_OUTPUT,`receipt_b64=${Buffer.from(JSON.stringify(receipt)).toString('base64')}\n`);
+            const fs = require('node:fs');
+            const artifactName = `meetwise-public-origin-receipt-${nonce}`;
+            const artifactPath = `${process.env.RUNNER_TEMP}/${artifactName}.json`;
+            const fd = fs.openSync(artifactPath, 'wx', 0o600);
+            try { fs.writeFileSync(fd, `${JSON.stringify(receipt)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,`receipt_path=${artifactPath}\n`);
           })().catch(e=>{console.error(e.message);process.exit(1)});
           NODE
+
+      - name: Upload the exact signed receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: meetwise-public-origin-receipt-${{ inputs.probe_nonce }}
+          path: ${{ steps.probe.outputs.receipt_path }}
+          if-no-files-found: error
+          retention-days: 1
