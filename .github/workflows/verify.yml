@@ -73,7 +73,7 @@ jobs:
             receipt.signature=sign(null,Buffer.from(canonical(receipt)),createPrivateKey(process.env.PROBE_SIGNING_KEY)).toString('base64');
             const fs = require('node:fs');
             const artifactName = `meetwise-public-origin-receipt-${nonce}`;
-            const artifactPath = `${process.env.RUNNER_TEMP}/${artifactName}.json`;
+            const artifactPath = `${process.env.RUNNER_TEMP}/receipt.json`;
             const fd = fs.openSync(artifactPath, 'wx', 0o600);
             try { fs.writeFileSync(fd, `${JSON.stringify(receipt)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
             fs.appendFileSync(process.env.GITHUB_OUTPUT,`receipt_path=${artifactPath}\n`);
